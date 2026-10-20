@@ -1376,6 +1376,12 @@ impl PdfWriter {
             let Some(mut font) = embedded.remove(&resource_name) else {
                 continue;
             };
+            // A registered face no text was drawn in has nothing to embed; its subset would
+            // still carry the face's tables. No content stream can name it, so leaving it out
+            // of every page's /Font dictionary changes nothing that is drawn.
+            if !font.is_used() {
+                continue;
+            }
             // Allocate IDs upfront so we don't need to borrow `self` inside
             // the build closure.
             let mut allocated: Vec<u32> = (0..5)

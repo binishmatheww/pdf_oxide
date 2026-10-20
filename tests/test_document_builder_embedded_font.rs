@@ -148,3 +148,28 @@ fn document_builder_embedded_font_inline_color_emits_rg() {
          embedded text would render black"
     );
 }
+
+#[test]
+fn document_builder_registered_but_unused_embedded_font_is_not_written() {
+    // A face registered for a script the document never prints has no
+    // glyphs to embed; writing its subset anyway costs every document the
+    // face's tables.
+    let mut builder = DocumentBuilder::new()
+        .compress_streams(false)
+        .register_embedded_font("Used", load_dejavu_sans())
+        .register_embedded_font("Unused", load_dejavu_sans());
+    builder
+        .a4_page()
+        .font("Used", 12.0)
+        .at(72.0, 700.0)
+        .text("Привет")
+        .done();
+
+    let bytes = builder.build().expect("build should succeed");
+    let content = String::from_utf8_lossy(&bytes);
+    assert_eq!(content.matches("/FontFile2").count(), 1, "only the face in use is embedded");
+
+    let doc = PdfDocument::from_bytes(bytes).expect("parse produced pdf");
+    let text = doc.extract_text(0).expect("extract_text should succeed");
+    assert!(text.contains("Привет"), "the used face still draws — got: {text:?}");
+}
