@@ -119,6 +119,27 @@ pub enum ContentStreamOp {
         /// Original-face glyph IDs in logical text order.
         glyph_ids: Vec<u16>,
     },
+    /// Show a shaped run from a registered embedded font, every glyph at the
+    /// position the shaper gave it: its own advance, plus its x/y offset from
+    /// the pen (mark attachment, kerning, cursive joins).
+    ///
+    /// Serialized as one `TJ` per baseline offset — the numbers in the array
+    /// turn each glyph's `/W` width into the shaped advance and apply the x
+    /// offset — with `Ts` (text rise) for glyphs moved off the baseline. The
+    /// run is wrapped in `/Span <</ActualText …>> BDC … EMC` (ISO 32000-1
+    /// §14.9.4) carrying the source text, because a glyph-level ToUnicode
+    /// cannot express a conjunct (one glyph, several characters) or a vowel
+    /// sign drawn before the consonant it follows in the text.
+    ShowPlacedEmbeddedText {
+        /// PDF resource name of the embedded font (e.g. `"EF1"`).
+        font_name: String,
+        /// Original-face glyphs in visual order.
+        glyphs: Vec<PlacedGlyph>,
+        /// The `Tf` size, which converts a rise in 1/1000 em into `Ts` units.
+        font_size: f32,
+        /// The source text of the run, emitted as `/ActualText`.
+        actual_text: String,
+    },
     /// Show text with positioning (TJ)
     ShowTextArray(Vec<TextArrayItem>),
     /// Set character spacing (Tc)
@@ -332,6 +353,35 @@ pub enum TextArrayItem {
     Adjustment(f32),
 }
 
+/// One glyph of a shaped run, placed for
+/// [`ContentStreamOp::ShowPlacedEmbeddedText`].
+///
+/// Distances are in 1/1000 em — the unit of a `TJ` adjustment — so a run
+/// placed once serializes correctly at any font size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacedGlyph {
+    /// Glyph index in the original (pre-subset) face.
+    pub glyph_id: u16,
+    /// `TJ` adjustment written before the glyph. Negative moves it right:
+    /// this is the negated x offset.
+    pub shift_before: f32,
+    /// `TJ` adjustment written after the glyph, so the pen ends one shaped
+    /// advance past where the glyph started: `/W` width + x offset − advance.
+    pub shift_after: f32,
+    /// Offset from the baseline, up positive (`Ts` is this × size / 1000).
+    pub rise: f32,
+}
+
+/// A real number for a content stream: at most three decimals, never `-0`.
+fn pdf_number(v: f32) -> String {
+    let rounded = (v * 1000.0).round() / 1000.0;
+    if rounded == 0.0 {
+        "0".to_string()
+    } else {
+        format!("{}", rounded)
+    }
+}
+
 /// A record of a structure element and its marked-content IDs, collected
 /// during content-stream construction for StructTreeRoot emission.
 ///
@@ -478,6 +528,30 @@ impl ContentStreamBuilder {
         self.op(ContentStreamOp::ShowEmbeddedText {
             font_name: font_name.to_string(),
             glyph_ids,
+        });
+        self
+    }
+
+    /// Add a shaped, placed glyph run from a registered embedded font at a
+    /// position. See [`ContentStreamOp::ShowPlacedEmbeddedText`]; like
+    /// [`Self::embedded_text`], the glyph IDs are original-face IDs remapped
+    /// into the subset at serialization time.
+    pub fn placed_embedded_text(
+        &mut self,
+        font_name: &str,
+        glyphs: Vec<PlacedGlyph>,
+        font_size: f32,
+        actual_text: &str,
+        x: f32,
+        y: f32,
+    ) -> &mut Self {
+        self.begin_text();
+        self.op(ContentStreamOp::SetTextMatrix(1.0, 0.0, 0.0, 1.0, x, y));
+        self.op(ContentStreamOp::ShowPlacedEmbeddedText {
+            font_name: font_name.to_string(),
+            glyphs,
+            font_size,
+            actual_text: actual_text.to_string(),
         });
         self
     }
@@ -1492,6 +1566,55 @@ impl ContentStreamBuilder {
                     write!(w, "{:04X}", emitted)?;
                 }
                 write!(w, "> Tj")
+            },
+            ContentStreamOp::ShowPlacedEmbeddedText {
+                font_name,
+                glyphs,
+                font_size,
+                actual_text,
+            } => {
+                let remapper = remappers.get(font_name);
+                write!(w, "/Span <</ActualText <FEFF")?;
+                for unit in actual_text.encode_utf16() {
+                    write!(w, "{:04X}", unit)?;
+                }
+                writeln!(w, ">>> BDC")?;
+                // One TJ per stretch of glyphs on the same rise: `Ts` is text
+                // state, so it cannot change inside a TJ array.
+                let mut rise = 0.0f32;
+                let mut open = false;
+                for g in glyphs {
+                    if g.rise != rise {
+                        if open {
+                            writeln!(w, "] TJ")?;
+                            open = false;
+                        }
+                        rise = g.rise;
+                        writeln!(w, "{} Ts", pdf_number(rise * font_size / 1000.0))?;
+                    }
+                    if !open {
+                        write!(w, "[")?;
+                        open = true;
+                    }
+                    if g.shift_before != 0.0 {
+                        write!(w, "{} ", pdf_number(g.shift_before))?;
+                    }
+                    let emitted = remapper
+                        .and_then(|r| r.get(g.glyph_id))
+                        .unwrap_or(g.glyph_id);
+                    write!(w, "<{:04X}>", emitted)?;
+                    if g.shift_after != 0.0 {
+                        write!(w, " {}", pdf_number(g.shift_after))?;
+                    }
+                    write!(w, " ")?;
+                }
+                if open {
+                    writeln!(w, "] TJ")?;
+                }
+                if rise != 0.0 {
+                    writeln!(w, "0 Ts")?;
+                }
+                write!(w, "EMC")
             },
             ContentStreamOp::ShowTextArray(items) => {
                 write!(w, "[")?;

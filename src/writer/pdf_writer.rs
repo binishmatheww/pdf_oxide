@@ -184,6 +184,32 @@ impl<'a> PageBuilder<'a> {
         // is a silent no-op — missing-text is easier to debug than a
         // panic deep inside the writer, and HTML→PDF hits unknown fonts
         // often during early development.
+        #[cfg(feature = "system-fonts")]
+        {
+            let placed = self
+                .writer
+                .embedded_fonts
+                .get_mut(font_resource_name)
+                .filter(|font| font.shapes_text())
+                .map(|font| font.place_shaped_text(text));
+            match placed {
+                Some(Some(glyphs)) => {
+                    let page = &mut self.writer.pages[self.page_index];
+                    page.content_builder
+                        .begin_text()
+                        .set_font(font_resource_name, font_size)
+                        .placed_embedded_text(font_resource_name, glyphs, font_size, text, x, y);
+                    return self;
+                },
+                Some(None) => {
+                    log::warn!(
+                        "embedded font {font_resource_name} has shaping on but its face could not \
+                         be shaped; drawing one glyph per character"
+                    );
+                },
+                None => {},
+            }
+        }
         let glyph_ids = self
             .writer
             .embedded_fonts
@@ -209,7 +235,13 @@ impl<'a> PageBuilder<'a> {
     ///
     /// `direction` controls visual reordering — pass
     /// [`crate::writer::font_shaping::Direction::Rtl`] for Arabic/
-    /// Hebrew runs after BiDi segmentation.
+    /// Hebrew runs after BiDi segmentation. (A font registered
+    /// [`EmbeddedFont::with_shaping`] needs neither this call nor the
+    /// segmentation: `add_embedded_text` does both.)
+    ///
+    /// Every glyph is drawn at its shaped position — its own advance plus
+    /// the shaper's x/y offset — so mark attachment and kerning survive;
+    /// see [`crate::writer::ContentStreamOp::ShowPlacedEmbeddedText`].
     ///
     /// On any error (unknown resource, unparseable face) this is a
     /// silent no-op for the same reason as `add_embedded_text`: a
@@ -229,19 +261,17 @@ impl<'a> PageBuilder<'a> {
         };
         // Shape directly against the font's owned bytes — no clone.
         // `shape` returns owned ShapedRun, so the &[u8] borrow on `font`
-        // is released before we call `encode_shaped_run` (&mut self).
+        // is released before we call `place_shaped_run` (&mut self).
         let Some(shaped) = super::font_shaping::shape(text, font.font_data(), direction) else {
             return self;
         };
-        // encode_shaped_run records (codepoint, glyph) pairs via the
-        // shaper's cluster field so the ToUnicode CMap round-trips.
-        let glyph_ids = font.encode_shaped_run(&shaped, text);
+        let glyphs = font.place_shaped_run(&shaped, text);
 
         let page = &mut self.writer.pages[self.page_index];
         page.content_builder
             .begin_text()
             .set_font(font_resource_name, font_size)
-            .embedded_text(font_resource_name, glyph_ids, x, y);
+            .placed_embedded_text(font_resource_name, glyphs, font_size, text, x, y);
         self
     }
 

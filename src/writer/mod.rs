@@ -95,7 +95,7 @@ pub use barcode::{
     BarcodeGenerator, BarcodeOptions, BarcodeType, QrCodeOptions, QrErrorCorrection,
 };
 pub use content_stream::{
-    BlendMode, ContentStreamBuilder, ContentStreamOp, LineCap, LineJoin, PendingImage,
+    BlendMode, ContentStreamBuilder, ContentStreamOp, LineCap, LineJoin, PendingImage, PlacedGlyph,
     TextArrayItem,
 };
 // Crate-internal: shared Standard-14 name mapping so the editor's overlay-font

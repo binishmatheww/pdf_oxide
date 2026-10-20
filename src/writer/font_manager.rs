@@ -856,6 +856,8 @@ pub struct EmbeddedFont {
     glyph_lookup: HashMap<u32, u16>,
     /// Cached glyph widths (GID -> width in 1/1000 em)
     glyph_widths: HashMap<u16, u16>,
+    /// Shape text in this font (see [`Self::with_shaping`]).
+    shaping: bool,
     /// Font ascender value
     pub ascender: i32,
     /// Font descender value
@@ -902,8 +904,13 @@ impl EmbeddedFont {
         for codepoint in font.supported_codepoints() {
             if let Some(gid) = font.glyph_id(codepoint) {
                 glyph_lookup.insert(codepoint, gid);
-                glyph_widths.insert(gid, font.glyph_width(gid));
             }
+        }
+        // Every glyph's `hmtx` advance, not only the cmap-reachable ones: a shaper emits
+        // ligatures, conjuncts and contextual forms that no codepoint maps to, and their
+        // `/W` entry must be the face's real advance rather than the 500 fallback.
+        for gid in 0..font.num_glyphs() {
+            glyph_widths.insert(gid, font.glyph_width(gid));
         }
 
         Ok(Self {
@@ -914,6 +921,7 @@ impl EmbeddedFont {
             encoder: UnicodeEncoder::new(),
             glyph_lookup,
             glyph_widths,
+            shaping: false,
             ascender: metrics.pdf_ascender(),
             descender: metrics.pdf_descender(),
             cap_height: metrics.pdf_cap_height(),
@@ -1039,7 +1047,22 @@ impl EmbeddedFont {
     }
 
     /// Calculate text width in points at the given font size.
+    ///
+    /// A font with shaping on (see [`Self::with_shaping`]) is measured by its
+    /// shaped advances — what it will actually occupy on the page — rather than
+    /// one cmap glyph per character, which is wrong for any script whose
+    /// clusters are not one glyph per character.
     pub fn text_width(&self, text: &str, font_size: f32) -> f32 {
+        #[cfg(feature = "system-fonts")]
+        if self.shaping {
+            if let Some(runs) = self.shape_visual_runs(text) {
+                let advance: i64 = runs
+                    .iter()
+                    .map(|(run, _)| i64::from(run.total_x_advance))
+                    .sum();
+                return advance as f32 * font_size / f32::from(self.units_per_em.max(1));
+            }
+        }
         let width_units: f32 = text.chars().map(|c| self.char_width(c as u32) as f32).sum();
         width_units * font_size / 1000.0
     }
@@ -1094,21 +1117,120 @@ impl EmbeddedFont {
     ) -> Vec<u16> {
         let mut glyph_ids = Vec::with_capacity(shaped.glyphs.len());
         for g in &shaped.glyphs {
-            // Some glyphs (e.g. notdef fallbacks) may map to an empty
-            // cluster or off the end of the string — fall back to
-            // `use_glyph` (no ToUnicode) rather than panic on bad bounds.
-            let codepoint = source_text
-                .get(g.cluster as usize..)
-                .and_then(|tail| tail.chars().next())
-                .map(|ch| ch as u32);
-            if let Some(cp) = codepoint {
-                self.subsetter.use_char(cp, g.glyph_id);
-            } else {
-                self.subsetter.use_glyph(g.glyph_id);
-            }
+            self.use_shaped_glyph(g, source_text);
             glyph_ids.push(g.glyph_id);
         }
         glyph_ids
+    }
+
+    /// Record a shaped glyph with the subsetter, under the first codepoint of
+    /// its cluster so the ToUnicode CMap has an entry for it.
+    #[cfg(feature = "system-fonts")]
+    fn use_shaped_glyph(
+        &mut self,
+        g: &crate::writer::font_shaping::ShapedGlyph,
+        source_text: &str,
+    ) {
+        // Some glyphs (e.g. notdef fallbacks) may map to an empty
+        // cluster or off the end of the string — fall back to
+        // `use_glyph` (no ToUnicode) rather than panic on bad bounds.
+        let codepoint = source_text
+            .get(g.cluster as usize..)
+            .and_then(|tail| tail.chars().next())
+            .map(|ch| ch as u32);
+        if let Some(cp) = codepoint {
+            self.subsetter.use_char(cp, g.glyph_id);
+        } else {
+            self.subsetter.use_glyph(g.glyph_id);
+        }
+    }
+
+    /// Shape all text drawn in this font: every run is shaped with harfrust
+    /// and each glyph placed at its shaped position (advances, mark and
+    /// kerning offsets), and [`Self::text_width`] measures shaped advances.
+    ///
+    /// Needed for any script whose glyphs are not one per character —
+    /// Indic conjuncts and vowel signs, Arabic contextual forms — and
+    /// harmless for Latin, where it adds the font's kerning. Off by default,
+    /// so existing documents are byte-identical.
+    #[cfg(feature = "system-fonts")]
+    pub fn with_shaping(mut self, enabled: bool) -> Self {
+        self.shaping = enabled;
+        self
+    }
+
+    /// Whether text in this font is shaped (see [`Self::with_shaping`]).
+    pub fn shapes_text(&self) -> bool {
+        self.shaping
+    }
+
+    /// Split one line of text into its UAX #9 directional runs, in visual
+    /// order, and shape each in its own direction — so Latin digits inside
+    /// an Arabic name stay left-to-right. `None` if the face cannot be
+    /// shaped.
+    #[cfg(feature = "system-fonts")]
+    fn shape_visual_runs(
+        &self,
+        text: &str,
+    ) -> Option<Vec<(crate::writer::font_shaping::ShapedRun, std::ops::Range<usize>)>> {
+        use crate::writer::font_shaping::{shape, Direction};
+        let info = unicode_bidi::BidiInfo::new(text, None);
+        let mut out = Vec::new();
+        for para in &info.paragraphs {
+            let (levels, runs) = info.visual_runs(para, para.range.clone());
+            for range in runs {
+                let direction = if levels[range.start].is_rtl() {
+                    Direction::Rtl
+                } else {
+                    Direction::Ltr
+                };
+                let run = shape(&text[range.clone()], self.font_data(), direction)?;
+                out.push((run, range));
+            }
+        }
+        Some(out)
+    }
+
+    /// Place a shaped run for [`crate::writer::ContentStreamOp::ShowPlacedEmbeddedText`]:
+    /// registers every glyph with the subsetter, and turns each shaped
+    /// advance and offset into the `TJ` numbers that put the glyph there
+    /// given its `/W` width.
+    #[cfg(feature = "system-fonts")]
+    pub(crate) fn place_shaped_run(
+        &mut self,
+        shaped: &crate::writer::font_shaping::ShapedRun,
+        source_text: &str,
+    ) -> Vec<crate::writer::content_stream::PlacedGlyph> {
+        let per_unit = 1000.0 / f32::from(self.units_per_em.max(1));
+        let mut placed = Vec::with_capacity(shaped.glyphs.len());
+        for g in &shaped.glyphs {
+            self.use_shaped_glyph(g, source_text);
+            let width = f32::from(self.glyph_width(g.glyph_id));
+            let dx = g.x_offset as f32 * per_unit;
+            let advance = g.x_advance as f32 * per_unit;
+            placed.push(crate::writer::content_stream::PlacedGlyph {
+                glyph_id: g.glyph_id,
+                shift_before: -dx,
+                shift_after: width + dx - advance,
+                rise: g.y_offset as f32 * per_unit,
+            });
+        }
+        placed
+    }
+
+    /// Shape one line of text (bidi-segmented, see [`Self::shape_visual_runs`])
+    /// and place every glyph. `None` if the face cannot be shaped.
+    #[cfg(feature = "system-fonts")]
+    pub(crate) fn place_shaped_text(
+        &mut self,
+        text: &str,
+    ) -> Option<Vec<crate::writer::content_stream::PlacedGlyph>> {
+        let runs = self.shape_visual_runs(text)?;
+        let mut placed = Vec::new();
+        for (run, range) in &runs {
+            placed.extend(self.place_shaped_run(run, &text[range.clone()]));
+        }
+        Some(placed)
     }
 
     /// Get the subset font name (generates tag if needed).
@@ -2050,5 +2172,104 @@ mod tests {
         // Colon for Helvetica-Bold = 333
         let w = font.char_width(':');
         assert!((w - 333.0).abs() < 0.001);
+    }
+
+    const MALAYALAM: &[u8] =
+        include_bytes!("../../tests/fixtures/fonts/NotoSansMalayalam-Regular.ttf");
+
+    /// A conjunct glyph no codepoint maps to used to take the 500 fallback,
+    /// so its `/W` entry — and every glyph drawn after it — was wrong.
+    #[test]
+    fn glyph_width_of_a_glyph_unreachable_from_the_cmap_is_its_hmtx_advance() {
+        let font = EmbeddedFont::from_data(None, MALAYALAM.to_vec()).unwrap();
+        // ക്ക (KA + VIRAMA + KA) is the single glyph 163, 1506 units wide on a
+        // 1000-unit em; nothing in the cmap reaches it.
+        assert!(!font.glyph_lookup.values().any(|&gid| gid == 163));
+        assert_eq!(font.glyph_width(163), 1506);
+    }
+
+    #[cfg(feature = "system-fonts")]
+    mod shaping {
+        use super::*;
+        use crate::writer::content_stream::PlacedGlyph;
+        use crate::writer::font_shaping::{shape, Direction};
+
+        const DEJAVU: &[u8] = include_bytes!("../../tests/fixtures/fonts/DejaVuSans.ttf");
+
+        fn shaped(bytes: &[u8]) -> EmbeddedFont {
+            EmbeddedFont::from_data(None, bytes.to_vec())
+                .unwrap()
+                .with_shaping(true)
+        }
+
+        /// What a TJ array moves the pen by for one glyph: its `/W` width
+        /// less the adjustments around it (TJ numbers move left).
+        fn displacement(font: &EmbeddedFont, g: &PlacedGlyph) -> f32 {
+            f32::from(font.glyph_width(g.glyph_id)) - g.shift_before - g.shift_after
+        }
+
+        #[test]
+        fn placed_glyphs_carry_the_shaped_advances_and_mark_offsets() {
+            let mut font = shaped(DEJAVU);
+            let text = "مَرْحَبًا";
+            let run = shape(text, DEJAVU, Direction::Rtl).unwrap();
+            let placed = font.place_shaped_run(&run, text);
+            assert_eq!(placed.len(), run.glyphs.len());
+            let per_unit = 1000.0 / 2048.0; // DejaVu Sans' em
+            for (p, g) in placed.iter().zip(&run.glyphs) {
+                assert_eq!(p.glyph_id, g.glyph_id);
+                // Each glyph sits at pen + its x offset, on baseline + its y offset ...
+                assert!((p.shift_before + g.x_offset as f32 * per_unit).abs() < 1e-3);
+                assert!((p.rise - g.y_offset as f32 * per_unit).abs() < 1e-3);
+                // ... and the pen moves by exactly the shaped advance.
+                assert!((displacement(&font, p) - g.x_advance as f32 * per_unit).abs() < 1e-3);
+            }
+            // The harakat really are moved off the baseline and sideways —
+            // the positions the previous emission dropped.
+            assert!(placed.iter().any(|p| p.rise < 0.0 && p.shift_before != 0.0));
+        }
+
+        #[test]
+        fn a_conjunct_is_measured_by_its_shaped_advance_not_per_character() {
+            let font = shaped(MALAYALAM);
+            let plain = EmbeddedFont::from_data(None, MALAYALAM.to_vec()).unwrap();
+            // ക്ക: one 1506-unit glyph, where per character it is two KAs and a virama.
+            assert!((font.text_width("ക്ക", 10.0) - 15.06).abs() < 1e-3);
+            assert!(
+                (plain.text_width("ക്ക", 10.0) - font.text_width("ക്ക", 10.0)).abs() > 1.0,
+                "the per-character measure must differ, or this test proves nothing"
+            );
+        }
+
+        #[test]
+        fn digits_inside_right_to_left_text_keep_their_order() {
+            let mut font = shaped(DEJAVU);
+            let placed = font.place_shaped_text("مرحبا 2026").unwrap();
+            let digits: Vec<u16> = "2026"
+                .chars()
+                .map(|c| font.glyph_id(c as u32).unwrap())
+                .collect();
+            let ids: Vec<u16> = placed.iter().map(|p| p.glyph_id).collect();
+            assert!(
+                ids.windows(4).any(|w| w == digits.as_slice()),
+                "the number must read 2026 left to right inside the Arabic run: {ids:?}"
+            );
+            // The paragraph is right-to-left, so the number comes first visually.
+            assert_eq!(ids[..4], digits[..]);
+        }
+
+        #[test]
+        fn shaping_is_off_unless_asked_for() {
+            let font = EmbeddedFont::from_data(None, DEJAVU.to_vec()).unwrap();
+            assert!(!font.shapes_text());
+            // Unshaped measure is per character, so Latin kerning does not apply.
+            let per_char: f32 = "AV"
+                .chars()
+                .map(|c| f32::from(font.char_width(c as u32)))
+                .sum::<f32>()
+                / 100.0;
+            assert!((font.text_width("AV", 10.0) - per_char).abs() < 1e-3);
+            assert!(shaped(DEJAVU).text_width("AV", 10.0) < per_char, "kerning tightens AV");
+        }
     }
 }
